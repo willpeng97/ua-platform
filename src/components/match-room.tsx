@@ -5,7 +5,11 @@ import { CameraQr } from "@/components/camera-qr";
 import type { MatchDetail } from "@/lib/types";
 import type { RoomServerMessage } from "@/lib/protocol";
 import { useRoomSocket } from "@/lib/use-room-socket";
-import { createPeerConnection, fetchIceServers } from "@/lib/webrtc";
+import {
+  createPeerConnection,
+  fetchIceConfig,
+  getMediaDebug,
+} from "@/lib/webrtc";
 
 type Props = {
   initialMatch: MatchDetail;
@@ -17,12 +21,21 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
   const [match, setMatch] = useState(initialMatch);
   const [busy, setBusy] = useState(false);
   const [statusNote, setStatusNote] = useState("");
+  const [videoReady, setVideoReady] = useState(false);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
-  const makingOffer = useRef(false);
+  const pendingIce = useRef<RTCIceCandidateInit[]>([]);
+  const signalChain = useRef(Promise.resolve());
+  const answering = useRef(false);
+  const hasAnswered = useRef(false);
+  const answeredAt = useRef<number>(0);
+  const recoverTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const opponentId =
     match.player1Id === userId ? match.player2Id : match.player1Id;
+  const opponentIdRef = useRef(opponentId);
+  opponentIdRef.current = opponentId;
 
   const scoreFor = (pid: string) =>
     match.scores.find((s) => s.playerId === pid)?.score ?? 0;
@@ -34,33 +47,111 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
     setMatch(data.match);
   }, [match.id]);
 
+  const attachStream = useCallback(async (stream: MediaStream) => {
+    remoteStreamRef.current = stream;
+    const el = remoteVideoRef.current;
+    if (!el) return;
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
+    try {
+      if (!el.paused && el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        setVideoReady(true);
+        return;
+      }
+      await el.play();
+      setVideoReady(true);
+      setStatusNote("視訊播放中");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      el.muted = true;
+      try {
+        await el.play();
+        setVideoReady(true);
+        setStatusNote("視訊播放中");
+      } catch (err2) {
+        if (err2 instanceof DOMException && err2.name === "AbortError") return;
+        setStatusNote("已連線但瀏覽器阻擋播放，請點一下畫面");
+      }
+    }
+  }, []);
+
+  const flushIce = useCallback(async (pc: RTCPeerConnection) => {
+    const queued = pendingIce.current.splice(0);
+    for (const c of queued) {
+      try {
+        await pc.addIceCandidate(c);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, []);
+
+  const resetPeer = useCallback(() => {
+    pcRef.current?.close();
+    pcRef.current = null;
+    pendingIce.current = [];
+    answering.current = false;
+    hasAnswered.current = false;
+    answeredAt.current = 0;
+    remoteStreamRef.current = null;
+    setVideoReady(false);
+    const el = remoteVideoRef.current;
+    if (el) el.srcObject = null;
+  }, []);
+
   const ensurePc = useCallback(async () => {
     if (pcRef.current) return pcRef.current;
-    const iceServers = await fetchIceServers();
-    const pc = createPeerConnection(iceServers);
+    const ice = await fetchIceConfig("relay");
+    const pc = createPeerConnection(ice);
     pcRef.current = pc;
 
     pc.ontrack = (ev) => {
-      const el = remoteVideoRef.current;
-      if (el) {
-        el.srcObject = ev.streams[0] ?? new MediaStream([ev.track]);
+      let stream = ev.streams[0];
+      if (!stream) {
+        stream = remoteStreamRef.current ?? new MediaStream();
+        if (!stream.getTracks().includes(ev.track)) {
+          stream.addTrack(ev.track);
+        }
       }
+      ev.track.onunmute = () => {
+        void attachStream(stream!);
+      };
+      void attachStream(stream);
     };
 
     pc.onicecandidate = (ev) => {
-      if (!ev.candidate || !opponentId) return;
+      const to = opponentIdRef.current;
+      if (!ev.candidate || !to) return;
       void publishSignalRef.current({
         type: "SIGNAL",
         matchId: match.id,
         fromPlayerId: userId,
-        toPlayerId: opponentId,
+        toPlayerId: to,
         fromRole: "desktop",
         signal: { kind: "ice", candidate: ev.candidate.toJSON() },
       });
     };
 
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        setStatusNote((n) =>
+          n.includes("播放") ? n : "WebRTC 已連線，等待畫面…",
+        );
+      } else if (pc.connectionState === "failed") {
+        setStatusNote("WebRTC 失敗，正在重置等待手機重連…");
+        resetPeer();
+      }
+    };
+
+    setStatusNote(
+      ice.hasTurn
+        ? "使用 TURN relay 連線中…"
+        : "無 TURN，改用直連（可能不穩）…",
+    );
+
     return pc;
-  }, [match.id, opponentId, userId]);
+  }, [attachStream, match.id, resetPeer, userId]);
 
   const publishSignalRef = useRef<
     (msg: {
@@ -77,65 +168,109 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
     }) => Promise<boolean>
   >(async () => false);
 
+  const handleSignal = useCallback(
+    async (msg: Extract<RoomServerMessage, { type: "SIGNAL" }>) => {
+      if (msg.toPlayerId !== userId || msg.fromRole !== "camera") return;
+      const to = opponentIdRef.current;
+      if (!to || msg.fromPlayerId !== to) return;
+
+      const pc = await ensurePc();
+      const { signal } = msg;
+
+      if (signal.kind === "ice" && signal.candidate) {
+        if (!pc.remoteDescription) {
+          pendingIce.current.push(signal.candidate);
+        } else {
+          try {
+            await pc.addIceCandidate(signal.candidate);
+          } catch {
+            /* ignore */
+          }
+        }
+        return;
+      }
+
+      if (signal.kind !== "offer" || !signal.sdp) return;
+
+      if (hasAnswered.current && pc.connectionState !== "failed") {
+        return;
+      }
+      if (answering.current) return;
+      let signaling = pc.signalingState;
+      if (signaling !== "stable") return;
+
+      answering.current = true;
+      try {
+        await pc.setRemoteDescription(signal.sdp);
+        await flushIce(pc);
+        signaling = pc.signalingState;
+        if (signaling !== "have-remote-offer") return;
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        hasAnswered.current = true;
+        answeredAt.current = Date.now();
+        await publishSignalRef.current({
+          type: "SIGNAL",
+          matchId: match.id,
+          fromPlayerId: userId,
+          toPlayerId: to,
+          fromRole: "desktop",
+          signal: {
+            kind: "answer",
+            sdp: pc.localDescription?.toJSON() ?? answer,
+          },
+        });
+        setStatusNote("已收到對手攝影機連線，等待畫面…");
+      } catch (err) {
+        console.error("desktop signal error", err);
+        if (
+          !(err instanceof DOMException && err.name === "InvalidStateError")
+        ) {
+          setStatusNote(
+            err instanceof Error ? err.message : "處理視訊訊號失敗",
+          );
+        }
+      } finally {
+        answering.current = false;
+      }
+    },
+    [ensurePc, flushIce, match.id, userId],
+  );
+
   const onMessage = useCallback(
-    async (msg: RoomServerMessage) => {
+    (msg: RoomServerMessage) => {
       if (msg.type === "SCORE_UPDATED") {
         setMatch((m) => ({ ...m, scores: msg.scores }));
-      } else if (msg.type === "MATCH_UPDATED") {
+        return;
+      }
+      if (msg.type === "MATCH_UPDATED") {
         setMatch((m) => ({
           ...m,
           status: msg.status as MatchDetail["status"],
         }));
         void refresh();
-      } else if (msg.type === "MATCH_FINISHED") {
+        return;
+      }
+      if (msg.type === "MATCH_FINISHED") {
         setMatch((m) => ({
           ...m,
           status: "FINISHED",
           winnerId: msg.winnerId,
         }));
         void refresh();
-      } else if (msg.type === "PLAYER_JOINED") {
+        return;
+      }
+      if (msg.type === "PLAYER_JOINED") {
         void refresh();
-      } else if (msg.type === "SIGNAL" && msg.toPlayerId === userId) {
-        // Receive stream from opponent's camera (fromRole === camera)
-        // or handle answer from... actually desktop only receives from opponent camera
-        if (msg.fromRole !== "camera") return;
-        if (!opponentId || msg.fromPlayerId !== opponentId) return;
-
-        const pc = await ensurePc();
-        const { signal } = msg;
-
-        try {
-          if (signal.kind === "offer" && signal.sdp) {
-            await pc.setRemoteDescription(signal.sdp);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            await publishSignalRef.current({
-              type: "SIGNAL",
-              matchId: match.id,
-              fromPlayerId: userId,
-              toPlayerId: opponentId,
-              fromRole: "desktop",
-              signal: { kind: "answer", sdp: answer },
-            });
-            setStatusNote("已收到對手攝影機連線");
-          } else if (signal.kind === "answer" && signal.sdp) {
-            if (!makingOffer.current) {
-              await pc.setRemoteDescription(signal.sdp);
-            }
-          } else if (signal.kind === "ice" && signal.candidate) {
-            try {
-              await pc.addIceCandidate(signal.candidate);
-            } catch {
-              /* ignore */
-            }
-          }
-        } catch (err) {
-          console.error("desktop signal error", err);
-        }
+        return;
+      }
+      if (msg.type === "SIGNAL") {
+        signalChain.current = signalChain.current
+          .then(() => handleSignal(msg))
+          .catch((err) => console.error(err));
       }
     },
-    [ensurePc, match.id, opponentId, refresh, userId],
+    [handleSignal, refresh],
   );
 
   const { connected, publishSignal } = useRoomSocket({
@@ -154,12 +289,49 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
     return () => clearInterval(t);
   }, [refresh]);
 
+  // Detect DTLS stuck: ICE up but no media bytes → reset and wait for new offer
+  useEffect(() => {
+    recoverTimer.current = setInterval(() => {
+      const pc = pcRef.current;
+      if (!pc || !hasAnswered.current) return;
+      void (async () => {
+        try {
+          const dbg = await getMediaDebug(pc);
+          if (dbg.framesDecoded > 0 || dbg.bytesReceived > 1000) {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setVideoReady(true);
+              setStatusNote("視訊播放中");
+            }
+            return;
+          }
+          if (
+            answeredAt.current &&
+            Date.now() - answeredAt.current > 10000 &&
+            (dbg.connectionState === "connecting" ||
+              dbg.dtlsState === "connecting" ||
+              dbg.iceConnectionState === "connected") &&
+            dbg.bytesReceived === 0
+          ) {
+            setStatusNote(
+              "媒體通道卡住（DTLS/無影格），重置中…請保持手機相機頁開啟",
+            );
+            resetPeer();
+          }
+        } catch {
+          /* ignore */
+        }
+      })();
+    }, 6000);
+    return () => {
+      if (recoverTimer.current) clearInterval(recoverTimer.current);
+    };
+  }, [resetPeer]);
+
   useEffect(() => {
     return () => {
-      pcRef.current?.close();
-      pcRef.current = null;
+      resetPeer();
     };
-  }, []);
+  }, [resetPeer]);
 
   async function bumpScore() {
     setBusy(true);
@@ -182,7 +354,9 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
   async function start() {
     setBusy(true);
     try {
-      const res = await fetch(`/api/matches/${match.id}/start`, { method: "POST" });
+      const res = await fetch(`/api/matches/${match.id}/start`, {
+        method: "POST",
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Start failed");
       setMatch(data.match);
@@ -303,14 +477,28 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
 
       <section className="flex flex-col gap-4">
         <div className="overflow-hidden rounded-2xl border border-zinc-800 bg-black">
-          <div className="border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
-            對手牌桌視訊
+          <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
+            <span>對手牌桌視訊{videoReady ? " · 播放中" : ""}</span>
+            <button
+              type="button"
+              className="text-xs text-emerald-400 hover:underline"
+              onClick={() => {
+                setStatusNote("手動重置視訊，等待手機重新連線…");
+                resetPeer();
+              }}
+            >
+              重置視訊連線
+            </button>
           </div>
           <video
             ref={remoteVideoRef}
             autoPlay
             playsInline
+            muted
             className="aspect-video w-full bg-zinc-950 object-contain"
+            onClick={(e) => {
+              void e.currentTarget.play().catch(() => undefined);
+            }}
           />
         </div>
 
@@ -318,6 +506,9 @@ export function MatchRoom({ initialMatch, userId, appUrl }: Props) {
           <h2 className="mb-2 text-sm font-medium text-zinc-400">
             用手機掃描此 QR，當作你的牌桌攝影機
           </h2>
+          <p className="mb-3 text-xs text-zinc-500">
+            注意：你掃自己的 QR 後，畫面會出現在「對手」的桌機上，不是自己這台。
+          </p>
           {camUrl ? (
             <CameraQr url={camUrl} />
           ) : (

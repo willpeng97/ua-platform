@@ -32,6 +32,7 @@ export function useRoomSocket({
   onMessageRef.current = onMessage;
   const lastPollId = useRef<string | undefined>(undefined);
   const usePolling = useRef(false);
+  const pollBootstrapped = useRef(false);
 
   const send = useCallback((msg: RoomClientMessage) => {
     const ws = wsRef.current;
@@ -62,6 +63,8 @@ export function useRoomSocket({
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let delay = 1000;
+    lastPollId.current = undefined;
+    pollBootstrapped.current = false;
 
     async function poll() {
       try {
@@ -76,6 +79,16 @@ export function useRoomSocket({
             payload: unknown;
           }[];
         };
+
+        // First poll: only advance cursor, don't replay historical SIGNAL storms
+        if (!pollBootstrapped.current) {
+          pollBootstrapped.current = true;
+          if (data.messages.length > 0) {
+            lastPollId.current = data.messages[data.messages.length - 1].id;
+          }
+          return;
+        }
+
         for (const m of data.messages) {
           lastPollId.current = m.id;
           if (m.type === "SIGNAL") {
